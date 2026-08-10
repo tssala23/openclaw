@@ -1,68 +1,136 @@
 import { createHash } from "node:crypto";
 import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { stableStringify } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
-import { requireNodeSqlite } from "../infra/node-sqlite.js";
+import { stableStringify } from "../agents/stable-stringify.js";
+import type { McpServerConfig } from "../config/types.mcp.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
+import { applyClawAddPlan } from "./add.js";
+import { buildClawAddPlan } from "./lifecycle.js";
+import { installClawMcpServers } from "./mcp.js";
 import { persistClawPackageRef } from "./provenance.js";
 import { parseClawManifest } from "./schema.js";
-import type { ClawPackage } from "./types.js";
+import type { ClawPackage, ClawSourceIdentity, ResolvedClawPackage } from "./types.js";
 import { buildClawUpdatePlan } from "./update-plan.js";
-import {
-  createUpdatePlanFixture,
-  packagePreflight,
-  targetSource,
-} from "./update-plan.test-helpers.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 afterEach(() => closeOpenClawStateDatabaseForTest());
 
+const packagePreflight = async (pkg: { kind: "skill" | "plugin"; ref: string }) => ({
+  ok: true as const,
+  action: "install" as const,
+  integrity: `sha256:${"a".repeat(64)}`,
+  ...(pkg.kind === "plugin" ? { installId: pkg.ref } : {}),
+});
+
 async function fixture() {
   const root = tempDirs.make("openclaw-claw-update-");
-  return await createUpdatePlanFixture(root);
+  await writeFile(join(root, "SOUL.md"), "base soul\n", "utf8");
+  await writeFile(join(root, "OLD.md"), "old\n", "utf8");
+  const raw = {
+    schemaVersion: 1,
+    agent: { id: "worker", name: "Worker" },
+    workspace: {
+      bootstrapFiles: { "SOUL.md": { source: "SOUL.md" } },
+      files: [{ source: "OLD.md", path: "OLD.md" }],
+    },
+    packages: [
+      {
+        kind: "skill",
+        source: "clawhub",
+        ref: "triage",
+        version: "1.0.0",
+      },
+      {
+        kind: "plugin",
+        source: "clawhub",
+        ref: "obsolete",
+        version: "1.0.0",
+      },
+    ],
+    mcpServers: { docs: { command: "uvx", args: ["docs-mcp"] } },
+    cronJobs: [
+      {
+        id: "daily",
+        schedule: { cron: "0 9 * * *", timezone: "UTC" },
+        session: "isolated",
+        message: "Base report",
+      },
+    ],
+  };
+  const parsed = parseClawManifest(raw);
+  if (!parsed.ok) {
+    throw new Error(JSON.stringify(parsed.diagnostics));
+  }
+  const source: ClawSourceIdentity = {
+    kind: "package",
+    name: "@acme/worker",
+    version: "1.0.0",
+    packageRoot: root,
+    manifestPath: join(root, "openclaw.claw.json"),
+    integrityKind: "artifact",
+    integrity: "sha256:base",
+    byteLength: 100,
+  };
+  const env = { OPENCLAW_STATE_DIR: join(root, "state") };
+  const addPlan = await buildClawAddPlan({
+    manifest: parsed.manifest,
+    source,
+    context: { workspace: join(root, "workspace-worker"), packagePreflight },
+  });
+  if (addPlan.blockers.length > 0) {
+    throw new Error(JSON.stringify(addPlan.blockers));
+  }
+  let config: OpenClawConfig = {};
+  await applyClawAddPlan(addPlan, {
+    consentPlanIntegrity: addPlan.planIntegrity,
+    env,
+    commitConfig: async (transform) => {
+      config = transform(config);
+    },
+    installPackages: async (plan, options) =>
+      plan.actions
+        .filter((action) => action.kind === "package")
+        .map((action) =>
+          persistClawPackageRef(plan, action.details as ResolvedClawPackage, options),
+        ),
+    installMcpServers: async (plan, options) =>
+      await installClawMcpServers(plan, {
+        ...options,
+        setMcpServer: async ({ name, server }) => {
+          const servers = { ...config.mcp?.servers, [name]: server as McpServerConfig };
+          config.mcp = { ...config.mcp, servers };
+          return { ok: true, path: "config", config, mcpServers: servers };
+        },
+        listMcpServers: async () => ({ ok: true, path: "config", config, mcpServers: {} }),
+      }),
+    cronGateway: { add: async () => ({ id: "scheduler-daily" }) },
+  });
+  return { root, env, config, manifest: parsed.manifest, source, addPlan };
+}
+
+function targetSource(root: string, version: string, integrity: string): ClawSourceIdentity {
+  return {
+    kind: "package",
+    name: "@acme/worker",
+    version,
+    packageRoot: root,
+    manifestPath: join(root, "openclaw.claw.json"),
+    integrityKind: "artifact",
+    integrity,
+    byteLength: 100,
+  };
 }
 
 describe("buildClawUpdatePlan", () => {
-  it("reads pre-bootstrap-column v6 state without mutating it", async () => {
-    const current = await fixture();
-    closeOpenClawStateDatabaseForTest();
-    const databasePath = resolveOpenClawStateSqlitePath(current.env);
-    const sqlite = requireNodeSqlite();
-    const database = new sqlite.DatabaseSync(databasePath);
-    try {
-      database.exec(`
-        ALTER TABLE claw_installs DROP COLUMN bootstrap_source_path;
-        ALTER TABLE claw_installs DROP COLUMN bootstrap_content_digest;
-      `);
-    } finally {
-      database.close();
-    }
-    const beforeBytes = await readFile(databasePath);
-    const beforeStat = await stat(databasePath);
-
-    const plan = await buildClawUpdatePlan({
-      agentId: "worker",
-      targetManifest: current.manifest,
-      targetSource: current.source,
-      config: current.config,
-      sourceMcpServers: current.config.mcp?.servers ?? {},
-      stateOptions: { env: current.env },
-      packagePreflight,
-    });
-
-    expect(plan).toMatchObject({ found: true, agentId: "worker", blockers: [] });
-    expect((await readFile(databasePath)).equals(beforeBytes)).toBe(true);
-    expect((await stat(databasePath)).mtimeMs).toBe(beforeStat.mtimeMs);
-  });
-
-  it("moves a portable plugin dependency into a profile extension edge without reinstalling", async () => {
+  it("relocates a v1 plugin package into a v2 extension edge without planning reinstall", async () => {
     const current = await fixture();
     const parsed = parseClawManifest({
       ...current.manifest,
@@ -76,7 +144,7 @@ describe("buildClawUpdatePlan", () => {
       agentId: "worker",
       targetManifest: parsed.manifest,
       targetOpenClawProfile: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         agent: {},
         extensions: [
           {
@@ -99,7 +167,7 @@ describe("buildClawUpdatePlan", () => {
             status: "found" as const,
             pluginId: "obsolete",
             installedVersion: "1.0.0",
-            record: { source: "clawhub", integrity: `sha256:${"a".repeat(64)}` },
+            record: { integrity: `sha256:${"a".repeat(64)}` },
           }),
         },
       },
@@ -126,15 +194,6 @@ describe("buildClawUpdatePlan", () => {
     expect(plan.actions).not.toContainEqual(
       expect.objectContaining({ kind: "package", id: "plugin:obsolete", action: "release" }),
     );
-    const extensionChange = plan.capabilityChanges.find(
-      (change) => change.kind === "package" && change.id === "plugin:obsolete",
-    );
-    expect(extensionChange?.effect.extension).toMatchObject({
-      id: "obsolete-tools",
-      mapped: ["skills"],
-      unavailable: ["agents"],
-    });
-    expect(extensionChange?.current?.digest).not.toBe(extensionChange?.desired?.digest);
   });
 
   it("plans missing package restoration without mutating state", async () => {
@@ -173,7 +232,7 @@ describe("buildClawUpdatePlan", () => {
       blockers: [],
     });
     expect(current.config).toEqual(beforeConfig);
-    expect((await readFile(databasePath)).equals(beforeBytes)).toBe(true);
+    expect(await readFile(databasePath)).toEqual(beforeBytes);
     expect((await stat(databasePath)).mtimeMs).toBe(beforeStat.mtimeMs);
   });
 
@@ -194,6 +253,81 @@ describe("buildClawUpdatePlan", () => {
     expect(plan.actions).toContainEqual(
       expect.objectContaining({ kind: "agent", id: "worker", action: "unchanged" }),
     );
+  });
+
+  it("plans setup personalization when upgrading to a setup schema target", async () => {
+    const current = await fixture();
+    await writeFile(join(current.root, "USER.md.tmpl"), "Seed once\n", "utf8");
+    const parsed = parseClawManifest({
+      ...current.manifest,
+      schemaVersion: 2,
+      packages: current.manifest.packages.filter((pkg) => pkg.kind === "skill"),
+      setup: { inputs: [] },
+      personalization: {
+        seeds: [{ source: "USER.md.tmpl", destination: "USER.md" }],
+      },
+    });
+    if (!parsed.ok) {
+      throw new Error(JSON.stringify(parsed.diagnostics));
+    }
+
+    const plan = await buildClawUpdatePlan({
+      agentId: "worker",
+      targetManifest: parsed.manifest,
+      targetSource: targetSource(current.root, "2.0.0", "sha256:target"),
+      config: current.config,
+      sourceMcpServers: current.config.mcp?.servers ?? {},
+      stateOptions: { env: current.env },
+      packagePreflight,
+    });
+
+    expect(plan.blockers).toEqual([]);
+    expect(plan.actions).toContainEqual(
+      expect.objectContaining({
+        kind: "personalizationSeed",
+        id: "USER.md",
+        action: "add",
+        blocked: false,
+      }),
+    );
+    expect(plan.setup?.createdSeeds).toEqual(["USER.md"]);
+  });
+
+  it("uses the profile extension path when update preflight fails", async () => {
+    const current = await fixture();
+    const plan = await buildClawUpdatePlan({
+      agentId: "worker",
+      targetManifest: current.manifest,
+      targetOpenClawProfile: {
+        schemaVersion: 2,
+        agent: {},
+        extensions: [
+          {
+            id: "reviewer",
+            format: "claude",
+            source: "clawhub",
+            ref: "reviewer",
+            version: "1.0.0",
+          },
+        ],
+      },
+      targetSource: current.source,
+      config: current.config,
+      sourceMcpServers: current.config.mcp?.servers ?? {},
+      stateOptions: { env: current.env },
+      packagePreflight: async (pkg) =>
+        pkg.ref === "reviewer"
+          ? { ok: false, code: "extension_unavailable", message: "Extension is unavailable." }
+          : packagePreflight(pkg),
+    });
+
+    expect(plan.blockers).toContainEqual(
+      expect.objectContaining({
+        code: "extension_unavailable",
+        path: "$.metadata.openclaw.config.extensions[0]",
+      }),
+    );
+    expect(plan.blockers.every((entry) => !entry.path.includes("[-1]"))).toBe(true);
   });
 
   it("plans restoration when the owned agent entry is missing", async () => {
@@ -735,7 +869,6 @@ describe("buildClawUpdatePlan", () => {
             ok: true as const,
             plan: {
               workspaceDir: current.addPlan.agent.workspace,
-              requestedRef: "triage",
               slug: "triage",
               version: "1.0.0",
               installedAt: 0,

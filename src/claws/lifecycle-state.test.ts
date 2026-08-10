@@ -226,9 +226,19 @@ describe("Claw status and remove", () => {
           status: "found" as const,
           pluginId: "audit",
           installedVersion: "2.0.0",
-          record: { source: "clawhub", integrity: packageIntegrity },
+          record: { integrity: packageIntegrity },
         }),
       },
+      packagePreflight: async () => ({
+        ok: true,
+        action: "reuse",
+        integrity: packageIntegrity,
+        installId: "audit",
+        detectedFormat: "claude",
+        mapped: ["skills"],
+        unavailable: ["agents"],
+        adapterIdentity: "openclaw/current",
+      }),
     });
 
     expect(status.summary.driftedPackages).toBe(1);
@@ -237,9 +247,8 @@ describe("Claw status and remove", () => {
       extension,
       extensionCompatibility: {
         state: "drifted",
-        mapped: ["agents", "skills"],
-        unavailable: [],
-        adapterIdentity: "openclaw/v1",
+        mapped: ["skills"],
+        adapterIdentity: "openclaw/current",
       },
     });
     expect(readClawPackageRefs({ env: current.env })[0]?.extension).toEqual(extension);
@@ -276,7 +285,7 @@ describe("Claw status and remove", () => {
           status: "found" as const,
           pluginId: "audit",
           installedVersion: "2.0.0",
-          record: { source: "clawhub", integrity: packageIntegrity },
+          record: { integrity: packageIntegrity },
         }),
       },
       packagePreflight: async () => ({
@@ -936,14 +945,6 @@ describe("Claw status and remove", () => {
       config,
       packageDeps,
     });
-    expect(plan.actions).toContainEqual(
-      expect.objectContaining({
-        kind: "packageRef",
-        action: "release",
-        reason: expect.stringContaining("Claw add introduced this shared requirement"),
-        details: expect.objectContaining({ introducedByClawAdd: true }),
-      }),
-    );
 
     await expect(
       applyClawRemovePlan(plan, {

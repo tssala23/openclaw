@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { ClawCronUpdateError } from "./cron-update.js";
-import type { buildClawAddPlan } from "./lifecycle.js";
 import {
   persistClawInstallRecord,
   readClawInstallRecord,
@@ -107,7 +106,6 @@ function plan(actions: ClawUpdatePlan["actions"]): ClawUpdatePlan {
     },
     actions,
     capabilityChanges: [],
-    readiness: { ready: true, requirements: [] },
     blockers: [],
     diagnostics: [],
   };
@@ -175,37 +173,6 @@ describe("applyClawUpdatePlan", () => {
     expect(readInstall).not.toHaveBeenCalled();
   });
 
-  it("rejects setup requirements that changed after consent", async () => {
-    const updatePlan = plan([]);
-    const changed = {
-      ...updatePlan,
-      readiness: {
-        ready: false,
-        requirements: [
-          {
-            kind: "plugin-setup" as const,
-            plugin: "market-data",
-            provider: "market-data",
-            envVars: ["MARKET_DATA_TOKEN"],
-            authMethods: ["token"],
-          },
-        ],
-      },
-    };
-
-    await expect(
-      applyClawUpdatePlan(
-        updatePlan,
-        { targetManifest: manifest, targetSource: source },
-        {
-          config: {},
-          ...consent(updatePlan),
-          rebuildPlan: async () => changed,
-        },
-      ),
-    ).rejects.toMatchObject({ code: "update_changed" });
-  });
-
   it("compare-writes the owned agent and advances root provenance", async () => {
     const currentAgent = { id: "worker", name: "Worker" };
     const currentDigest = `sha256:${createHash("sha256").update(stableStringify(currentAgent)).digest("hex")}`;
@@ -254,7 +221,7 @@ describe("applyClawUpdatePlan", () => {
     });
   });
 
-  it("activates cron only after owned state and agent updates succeed", async () => {
+  it("activates cron only after package and agent updates succeed", async () => {
     const updatePlan = plan([
       {
         kind: "agent",
@@ -304,94 +271,7 @@ describe("applyClawUpdatePlan", () => {
       },
     );
 
-    expect(order).toEqual(["workspace", "mcp", "agent", "cron", "provenance"]);
-  });
-
-  it("realizes new plugin requirements before workspace mutation and retains them on failure", async () => {
-    const targetPackage = {
-      kind: "plugin" as const,
-      source: "clawhub" as const,
-      ref: "github",
-      version: "1.0.0",
-    };
-    const packageDetails = {
-      ...targetPackage,
-      integrity: "sha256:github",
-      installId: "github",
-      ownerAction: "install" as const,
-    };
-    const desiredDigest = `sha256:${createHash("sha256")
-      .update(
-        stableStringify({
-          package: targetPackage,
-          integrity: packageDetails.integrity,
-          installId: packageDetails.installId,
-          riskWarning: undefined,
-          prerequisites: undefined,
-          extension: undefined,
-        }),
-      )
-      .digest("hex")}`;
-    const updatePlan = plan([
-      {
-        kind: "package",
-        id: "plugin:github",
-        action: "add",
-        target: "packages.plugin:github",
-        blocked: false,
-        reason: "target adds a shared plugin requirement",
-        desiredDigest,
-      },
-    ]);
-    const packageAddPlan: ClawAddPlan = {
-      ...addPlan,
-      actions: [
-        {
-          kind: "package",
-          id: "plugin:github",
-          action: "install",
-          target: "clawhub:github@1.0.0",
-          details: packageDetails,
-          blocked: false,
-        },
-      ],
-    };
-    const order: string[] = [];
-    const requirementRollback = vi.fn(async () => undefined);
-
-    await expect(
-      applyClawUpdatePlan(
-        updatePlan,
-        {
-          targetManifest: { ...manifest, packages: [targetPackage] },
-          targetSource: source,
-        },
-        {
-          config: {},
-          ...consent(updatePlan),
-          rebuildPlan: vi.fn(async () => updatePlan),
-          buildAddPlan: vi.fn(async () => packageAddPlan),
-          readInstall: vi.fn(() => install),
-          applyPackage: vi.fn(async (phase) => {
-            order.push("requirement");
-            expect(
-              phase.actions.map((action: ClawAddPlan["actions"][number]) => action.id),
-            ).toEqual(["plugin:github"]);
-            return { appliedIds: ["plugin:github"], rollback: requirementRollback };
-          }),
-          applyWorkspace: vi.fn(async () => {
-            order.push("workspace");
-            throw new Error("workspace unavailable");
-          }),
-        },
-      ),
-    ).rejects.toMatchObject({
-      code: "update_partial",
-      message: expect.stringContaining("shared requirements were retained"),
-    });
-
-    expect(order).toEqual(["requirement", "workspace"]);
-    expect(requirementRollback).not.toHaveBeenCalled();
+    expect(order).toEqual(["workspace", "mcp", "package", "agent", "cron", "provenance"]);
   });
 
   it("preserves cron prerequisites when the gateway mutation outcome is uncertain", async () => {
@@ -494,7 +374,6 @@ describe("applyClawUpdatePlan", () => {
           integrity: packageDetails.integrity,
           installId: undefined,
           riskWarning: undefined,
-          prerequisites: undefined,
           extension: undefined,
         }),
       )
@@ -572,7 +451,6 @@ describe("applyClawUpdatePlan", () => {
           integrity: resolved.integrity,
           installId: resolved.installId,
           riskWarning: resolved.warning,
-          prerequisites: undefined,
           extension: undefined,
         }),
       )
@@ -673,7 +551,6 @@ describe("applyClawUpdatePlan", () => {
           integrity: packageDetails.integrity,
           installId: packageDetails.installId,
           riskWarning: undefined,
-          prerequisites: undefined,
           extension: extensionProvenance,
         }),
       )
@@ -691,57 +568,30 @@ describe("applyClawUpdatePlan", () => {
     ]);
     const targetManifest: ClawManifest = {
       ...manifest,
-      schemaVersion: 1,
+      schemaVersion: 2,
       packages: [],
+      setup: { inputs: [] },
+      personalization: { seeds: [] },
     };
     const targetOpenClawProfile: ClawOpenClawProfile = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       agent: {},
       extensions: [extension],
     };
     const targetAddPlan: ClawAddPlan = {
       ...addPlan,
-      manifestSchemaVersion: 1,
+      manifestSchemaVersion: 2,
       actions: [
         {
           kind: "package",
           id: "plugin:github",
-          action: "install",
+          action: "reuse",
           target: "clawhub:github@2.0.0",
           details: packageDetails,
           blocked: false,
         },
       ],
     };
-    const conflictPreflight = {
-      ok: false as const,
-      code: "plugin_version_conflict",
-      message: "The Claw owns the installed previous version.",
-      installedVersion: "1.0.0",
-      integrity: packageDetails.integrity,
-      installId: packageDetails.installId,
-      detectedFormat: extensionProvenance.detectedFormat,
-      mapped: extensionProvenance.mapped,
-      unavailable: extensionProvenance.unavailable,
-      adapterIdentity: extensionProvenance.adapterIdentity,
-    };
-    const buildAddPlan = vi.fn(async (params: Parameters<typeof buildClawAddPlan>[0]) => {
-      const preflight = await params.context?.packagePreflight?.(
-        targetPackage,
-        addPlan.agent.workspace,
-      );
-      expect(preflight).toMatchObject({
-        ok: true,
-        action: "install",
-        integrity: packageDetails.integrity,
-        installId: packageDetails.installId,
-        detectedFormat: extensionProvenance.detectedFormat,
-        mapped: extensionProvenance.mapped,
-        unavailable: extensionProvenance.unavailable,
-        adapterIdentity: extensionProvenance.adapterIdentity,
-      });
-      return targetAddPlan;
-    });
     const applyPackage = vi.fn(async () => ({
       appliedIds: ["plugin:github"],
       rollback: vi.fn(async () => undefined),
@@ -754,8 +604,7 @@ describe("applyClawUpdatePlan", () => {
         config: {},
         ...consent(updatePlan),
         rebuildPlan: vi.fn(async () => updatePlan),
-        buildAddPlan,
-        packagePreflight: vi.fn(async () => conflictPreflight),
+        buildAddPlan: vi.fn(async () => targetAddPlan),
         readInstall: vi.fn(() => install),
         persistInstall: vi.fn(() => ({ ...install, claw: source })),
         applyWorkspace: vi.fn(async () => ({
@@ -771,10 +620,11 @@ describe("applyClawUpdatePlan", () => {
           rollback: vi.fn(async () => undefined),
         })),
         applyPackage,
+        applySetup: vi.fn(async () => undefined),
+        finalizeSetup: vi.fn(),
       },
     );
 
-    expect(buildAddPlan).toHaveBeenCalledOnce();
     expect(applyPackage).toHaveBeenCalledOnce();
   });
 
@@ -931,4 +781,4 @@ describe("applyClawUpdatePlan", () => {
   });
 });
 import { createHash } from "node:crypto";
-import { stableStringify } from "@openclaw/normalization-core";
+import { stableStringify } from "../agents/stable-stringify.js";

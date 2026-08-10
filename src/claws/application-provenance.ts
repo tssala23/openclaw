@@ -1,6 +1,5 @@
-import { stableStringify } from "@openclaw/normalization-core";
+import { stableStringify } from "../agents/stable-stringify.js";
 import { clawProfileExtensionPackages } from "./application-plan.js";
-import type { ClawPackageStatus } from "./lifecycle-status.js";
 import type { PersistedClawPackageRef } from "./provenance.js";
 import type {
   ClawAddPlanAction,
@@ -16,6 +15,7 @@ export function isApplicationUpdateBlocker(entry: ClawDiagnostic): boolean {
   return (
     entry.code !== "workspace_collision" &&
     entry.code !== "agent_id_collision" &&
+    !entry.code.startsWith("setup_") &&
     !entry.path.startsWith("$.packages")
   );
 }
@@ -28,7 +28,6 @@ export function recordingClawPackagePreflight(
   preflight: ClawPackagePreflight | undefined,
   workspace: string,
   results: Map<string, ClawPackagePreflightResult>,
-  currentPackages: ReadonlyMap<string, ClawPackageStatus>,
 ): ClawPackagePreflight {
   return async (pkg) => {
     const result = preflight
@@ -38,20 +37,8 @@ export function recordingClawPackagePreflight(
           code: "package_install_unavailable",
           message: "Package preflight is unavailable.",
         };
-    const current = currentPackages.get(clawPackageKey(pkg));
-    const normalized =
-      !result.ok &&
-      pkg.kind === "plugin" &&
-      result.code === "plugin_version_conflict" &&
-      current?.state === "present" &&
-      current.origin === "claw-introduced" &&
-      !current.independentOwner &&
-      current.version !== pkg.version &&
-      result.installedVersion === current.version
-        ? { ...result, ok: true as const, action: "install" as const }
-        : result;
-    results.set(clawPackageKey(pkg), normalized);
-    return normalized;
+    results.set(clawPackageKey(pkg), result);
+    return result;
   };
 }
 
@@ -69,7 +56,9 @@ export function clawTargetPackages(
 export function clawWorkspaceActionsById(actions: ClawAddPlanAction[]) {
   return new Map(
     actions
-      .filter((action) => action.kind === "workspaceFile")
+      .filter(
+        (action) => action.kind === "workspaceFile" && action.sourceKind !== "personalizationSeed",
+      )
       .map((action) => [action.id, action] as const),
   );
 }

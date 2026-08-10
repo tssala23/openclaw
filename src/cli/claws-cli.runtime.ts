@@ -1,19 +1,17 @@
 import { redactSensitiveUrlLikeString } from "@openclaw/net-policy/redact-sensitive-url";
-import { stableStringify } from "@openclaw/normalization-core";
 import {
   listAgentEntries,
   listAgentIds,
   resolveAgentWorkspaceDir,
 } from "../agents/agent-scope-config.js";
+import { stableStringify } from "../agents/stable-stringify.js";
 import {
   applyClawAddPlan,
   CLAW_ADD_RESULT_SCHEMA_VERSION,
   ClawAddMutationError,
 } from "../claws/add.js";
-import {
-  findClawExtensionPackageCollisions,
-  planClawExtensions,
-} from "../claws/application-plan.js";
+import { ClawAnswersError, readClawAnswersDocument } from "../claws/answers.js";
+import { planClawExtensions } from "../claws/application-plan.js";
 import { assertExperimentalClawsEnabled } from "../claws/experimental.js";
 import {
   CLAW_EXPORT_RESULT_SCHEMA_VERSION,
@@ -29,21 +27,16 @@ import {
   readClawStatus,
 } from "../claws/lifecycle-state.js";
 import { buildClawAddPlan } from "../claws/lifecycle.js";
-import {
-  findResumableIntroducedPluginRequirement,
-  readClawResumeStateReadOnly,
-} from "../claws/package-resume.js";
 import { preflightClawPackage } from "../claws/packages.js";
-import {
-  clawInstallRecordMatchesPlan,
-  readClawInstallRecord,
-  readClawPackageRefs,
-} from "../claws/provenance.js";
+import { readClawInstallRecord } from "../claws/provenance.js";
 import { readClawManifestFile } from "../claws/reader.js";
+import { isResumableClawSetupAdd } from "../claws/setup-state.js";
+import { buildClawSetupPlan } from "../claws/setup.js";
 import {
   CLAW_INSPECT_RESULT_SCHEMA_VERSION,
   CLAW_ADD_PLAN_SCHEMA_VERSION,
   CLAW_OUTPUT_STABILITY,
+  CLAW_SETUP_SCHEMA_VERSION,
   type ClawAddPlan,
 } from "../claws/types.js";
 // Runtime handlers for experimental local Claws commands.
@@ -86,15 +79,6 @@ function logClawAddPlanSummary(plan: ClawAddPlan, runtime: RuntimeEnv): void {
   runtime.log(`Workspace: ${plan.agent.workspace}`);
   runtime.log(`Actions: ${plan.summary.totalActions}`);
   runtime.log(`Packages: ${plan.summary.packageActions}`);
-  for (const action of plan.actions.filter((candidate) => candidate.kind === "package")) {
-    const requirementState =
-      typeof action.details?.requirementState === "string"
-        ? action.details.requirementState
-        : "unresolved";
-    runtime.log(
-      `  Requirement ${action.target}: ${requirementState}${action.action === "install" ? " (installation requires this exact plan consent)" : ""}`,
-    );
-  }
   runtime.log(`MCP servers: ${plan.summary.mcpServerActions}`);
   for (const action of plan.actions.filter((candidate) => candidate.kind === "mcpServer")) {
     const server = action.details as Record<string, unknown> | undefined;
@@ -112,6 +96,10 @@ function logClawAddPlanSummary(plan: ClawAddPlan, runtime: RuntimeEnv): void {
     runtime.log(`  MCP ${action.id}: ${target}`);
   }
   runtime.log(`Cron jobs: ${plan.summary.cronJobActions}`);
+  if (plan.setup) {
+    runtime.log(`Setup inputs: ${plan.setup.inputs.length}`);
+    runtime.log(`Personalization seeds: ${plan.setup.seeds.length}`);
+  }
   if (plan.capabilityChanges.length > 0) {
     runtime.log(`Capability escalations (${plan.capabilityChanges.length}):`);
     for (const change of plan.capabilityChanges) {
@@ -126,14 +114,15 @@ function logClawAddPlanSummary(plan: ClawAddPlan, runtime: RuntimeEnv): void {
   }
 }
 
-async function matchingResumeState(plan: ClawAddPlan, opts: ClawsAddOptions) {
-  const readOnlyState = opts.dryRun
-    ? await readClawResumeStateReadOnly(plan.agent.finalId)
-    : undefined;
-  const record = opts.dryRun ? readOnlyState?.record : readClawInstallRecord(plan.agent.finalId);
+function matchingResumeRecord(plan: ClawAddPlan, opts: ClawsAddOptions) {
+  if (opts.dryRun || !opts.yes || !opts.planIntegrity) {
+    return undefined;
+  }
+  const record = readClawInstallRecord(plan.agent.finalId);
   if (
     !record ||
     record.status === "complete" ||
+    record.planIntegrity !== opts.planIntegrity ||
     record.workspace !== plan.agent.workspace ||
     record.claw.kind !== plan.claw.kind ||
     record.claw.name !== plan.claw.name ||
@@ -142,10 +131,7 @@ async function matchingResumeState(plan: ClawAddPlan, opts: ClawsAddOptions) {
   ) {
     return undefined;
   }
-  return {
-    record,
-    packageRefs: readOnlyState?.packageRefs ?? readClawPackageRefs({ agentId: plan.agent.finalId }),
-  };
+  return record;
 }
 
 function failNonDryRun(opts: ClawsAddOptions, runtime: RuntimeEnv): boolean {
@@ -218,34 +204,27 @@ export async function runClawsInspectCommand(
     return;
   }
 
-  const extensionPlan = await planClawExtensions({
-    extensions: result.openClawProfile?.extensions ?? [],
+  const extensionInspection = await planClawExtensions({
+    extensions:
+      result.openClawProfile?.schemaVersion === 2 ? result.openClawProfile.extensions : [],
     workspace: result.source.packageRoot,
     packagePreflight: preflightClawPackage,
   });
-  const extensionCollisions = findClawExtensionPackageCollisions({
-    packages: result.manifest.packages,
-    extensions: result.openClawProfile?.extensions ?? [],
-  });
-  const diagnostics = [
-    ...result.diagnostics,
-    ...extensionPlan.blockers,
-    ...extensionCollisions.map(({ diagnostic }) => diagnostic),
-  ];
-  const valid = diagnostics.every((diagnostic) => diagnostic.level !== "error");
+  const diagnostics = [...result.diagnostics, ...extensionInspection.blockers];
+
   const payload = {
     schemaVersion: CLAW_INSPECT_RESULT_SCHEMA_VERSION,
     stability: CLAW_OUTPUT_STABILITY,
-    valid,
+    valid: extensionInspection.blockers.length === 0,
     source: result.source,
     manifest: result.manifest,
     ...(result.openClawProfile ? { openClawProfile: result.openClawProfile } : {}),
-    extensions: extensionPlan.extensions,
+    extensions: extensionInspection.extensions,
     diagnostics,
   };
   if (opts.json) {
     writeRuntimeJson(runtime, payload);
-    if (!valid) {
+    if (!payload.valid) {
       runtime.exit(1);
     }
     return;
@@ -254,15 +233,15 @@ export async function runClawsInspectCommand(
   runtime.log(`Claw: ${result.source.name}@${result.source.version}`);
   runtime.log(`Agent: ${result.manifest.agent.name ?? result.manifest.agent.id}`);
   runtime.log(`Packages: ${result.manifest.packages.length}`);
-  runtime.log(`Extension requirements: ${extensionPlan.extensions.length}`);
-  for (const extension of extensionPlan.extensions) {
+  runtime.log(`Extensions: ${extensionInspection.extensions.length}`);
+  for (const extension of extensionInspection.extensions) {
     runtime.log(
-      `  ${extension.id}: ${extension.requirementState}; ${extension.detectedFormat ?? "unresolved"} -> ${(extension.mapped ?? []).join(", ") || "no mapped capabilities"}`,
+      `  ${extension.id}: ${extension.detectedFormat ?? "unresolved"}; mapped=${extension.mapped.join(",") || "none"}; unavailable=${extension.unavailable.join(",") || "none"}`,
     );
   }
   runtime.log(`MCP servers: ${Object.keys(result.manifest.mcpServers).length}`);
   runtime.log(`Cron jobs: ${result.manifest.cronJobs.length}`);
-  if (!valid) {
+  if (!payload.valid) {
     runtime.error(formatDiagnostics(diagnostics));
     runtime.exit(1);
   }
@@ -293,6 +272,54 @@ export async function runClawsAddCommand(
     return;
   }
 
+  let answers: Record<string, unknown> | undefined;
+  if (opts.answers) {
+    if (result.manifest.schemaVersion !== CLAW_SETUP_SCHEMA_VERSION) {
+      const diagnostic = {
+        level: "error" as const,
+        code: "setup_answers_unsupported",
+        phase: "plan" as const,
+        path: "$.answers",
+        message: "This schema version 1 Claw does not declare setup inputs.",
+      };
+      if (opts.json) {
+        writeRuntimeJson(runtime, {
+          schemaVersion: CLAW_ADD_PLAN_SCHEMA_VERSION,
+          stability: CLAW_OUTPUT_STABILITY,
+          valid: false,
+          diagnostics: [diagnostic],
+        });
+      } else {
+        runtime.error(formatDiagnostics([diagnostic]));
+      }
+      runtime.exit(1);
+      return;
+    }
+    try {
+      answers = await readClawAnswersDocument(opts.answers);
+    } catch (error) {
+      const diagnostic = {
+        level: "error" as const,
+        code: error instanceof ClawAnswersError ? error.code : "setup_answers_read_failed",
+        phase: "parse" as const,
+        path: "$.answers",
+        message: error instanceof Error ? error.message : String(error),
+      };
+      if (opts.json) {
+        writeRuntimeJson(runtime, {
+          schemaVersion: CLAW_ADD_PLAN_SCHEMA_VERSION,
+          stability: CLAW_OUTPUT_STABILITY,
+          valid: false,
+          diagnostics: [diagnostic],
+        });
+      } else {
+        runtime.error(formatDiagnostics([diagnostic]));
+      }
+      runtime.exit(1);
+      return;
+    }
+  }
+
   const config = getRuntimeConfig();
   const listedMcpServers = await listConfiguredMcpServers();
   if (!listedMcpServers.ok) {
@@ -317,47 +344,35 @@ export async function runClawsAddCommand(
   let plan = await buildClawAddPlan({
     manifest: result.manifest,
     clawMarkdownBody: result.clawMarkdownBody,
-    packageBootstrap: result.packageBootstrap,
     openClawProfile: result.openClawProfile,
     source: result.source,
     diagnostics: result.diagnostics,
     context: basePlanContext,
+    answers,
   });
-  const resumeState = await matchingResumeState(plan, opts);
-  if (resumeState) {
-    const { record: resumeRecord, packageRefs: resumePackageRefs } = resumeState;
-    const packagePreflight = async (
-      pkg: Parameters<typeof preflightClawPackage>[0],
-      workspace: string,
-    ) => {
-      const preflight = await preflightClawPackage(pkg, workspace);
-      return findResumableIntroducedPluginRequirement({
-        agentId: resumeRecord.agentId,
-        pkg,
-        preflight,
-        refs: resumePackageRefs,
-      })
-        ? { ...preflight, action: "install" as const }
-        : preflight;
-    };
+  const resumeRecord = matchingResumeRecord(plan, opts);
+  if (resumeRecord && plan.blockers.length > 0) {
+    const canResumeSetup = resumeRecord.status === "partial" && isResumableClawSetupAdd(plan);
     const canResumeWorkspace =
-      resumeRecord.status === "workspace_ready" || resumeRecord.status === "config_committed";
+      resumeRecord.status === "workspace_ready" ||
+      resumeRecord.status === "config_committed" ||
+      canResumeSetup;
     const committedAgent = listAgentEntries(config).find(
       (agent) => stableStringify(agent) === stableStringify(plan.agent.config),
     );
     const canResumeAgent =
       resumeRecord.status === "config_committed" ||
+      canResumeSetup ||
       (resumeRecord.status === "workspace_ready" && committedAgent !== undefined);
     plan = await buildClawAddPlan({
       manifest: result.manifest,
       clawMarkdownBody: result.clawMarkdownBody,
-      packageBootstrap: result.packageBootstrap,
       openClawProfile: result.openClawProfile,
       source: result.source,
       diagnostics: result.diagnostics,
+      answers,
       context: {
         ...basePlanContext,
-        packagePreflight,
         existingAgentIds: canResumeAgent
           ? existingAgentIds.filter((agentId) => agentId !== resumeRecord.agentId)
           : existingAgentIds,
@@ -369,22 +384,6 @@ export async function runClawsAddCommand(
         ...(canResumeWorkspace ? { resumableWorkspace: resumeRecord.workspace } : {}),
       },
     });
-    if (plan.blockers.length === 0 && !clawInstallRecordMatchesPlan(resumeRecord, plan)) {
-      plan = {
-        ...plan,
-        blockers: [
-          ...plan.blockers,
-          {
-            level: "error",
-            code: "claw_resume_plan_mismatch",
-            phase: "plan",
-            path: "$",
-            message:
-              "The incomplete Claw add no longer matches the current plan; remove its partial state before retrying.",
-          },
-        ],
-      };
-    }
   }
 
   if (plan.blockers.length > 0) {
@@ -429,8 +428,19 @@ export async function runClawsAddCommand(
 
   let addResult;
   try {
+    const setupResult =
+      result.manifest.schemaVersion === CLAW_SETUP_SCHEMA_VERSION
+        ? await buildClawSetupPlan({
+            manifest: result.manifest,
+            packageRoot: result.source.packageRoot,
+            answers,
+          })
+        : undefined;
     addResult = await applyClawAddPlan(plan, {
       consentPlanIntegrity: opts.planIntegrity,
+      ...(setupResult?.materialization
+        ? { setupMaterialization: setupResult.materialization }
+        : {}),
       runtime: opts.json ? { ...runtime, log: () => undefined } : runtime,
       cronGateway: {
         add: async (input) => await callGatewayFromCli("cron.add", {}, input),
@@ -486,7 +496,7 @@ export async function runClawsStatusCommand(
         `${record.install.agentId}: ${record.install.claw.name}@${record.install.claw.version} (${record.install.status})`,
       );
       runtime.log(
-        `  Agent: ${record.agentState}; bootstrap: ${record.bootstrapState}; files: ${record.workspaceFiles.length}; packages: ${record.packages.length}`,
+        `  Agent: ${record.agentState}; files: ${record.workspaceFiles.length}; packages: ${record.packages.length}`,
       );
     }
   }
@@ -609,7 +619,7 @@ export async function runClawsExportCommand(
     const result = await exportClawAgent(agentId, opts.out, {
       config: getRuntimeConfig(),
       sourceMcpServers: listedMcpServers.mcpServers,
-      ...(opts.bootstrap ? { bootstrapPath: opts.bootstrap } : {}),
+      ...(opts.authorSetup ? { authorSetupPath: opts.authorSetup } : {}),
     });
     if (opts.json) {
       writeRuntimeJson(runtime, result);
@@ -622,7 +632,20 @@ export async function runClawsExportCommand(
       `Workspace files: ${result.manifest.workspace.files.length + Object.keys(result.manifest.workspace.bootstrapFiles).length}`,
     );
     runtime.log(`Packages: ${result.manifest.packages.length}`);
-    runtime.log(`Bootstrap: ${result.filesWritten.includes("BOOTSTRAP.md") ? "included" : "none"}`);
+    if (result.openClawProfile?.schemaVersion === 2) {
+      runtime.log(`Extensions: ${result.openClawProfile.extensions.length}`);
+    }
+    if (result.authoring) {
+      runtime.log(`Setup inputs: ${result.authoring.inputs.length}`);
+      runtime.log(`Personalization seeds: ${result.authoring.seeds.length}`);
+      runtime.log(`Private values checked: ${result.authoring.privateValuesChecked}`);
+      runtime.log(`Clean add preview: ${result.authoring.cleanAddPlanIntegrity}`);
+      for (const seed of result.authoring.seeds) {
+        runtime.log(
+          `Seed ${seed.destination}: template ${seed.templateDigest}, sample ${seed.sampleDigest} (${seed.sampleByteLength} bytes)`,
+        );
+      }
+    }
   } catch (error) {
     const code = error instanceof ClawExportError ? error.code : "export_failed";
     const message = error instanceof Error ? error.message : String(error);

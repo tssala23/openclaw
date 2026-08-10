@@ -55,7 +55,6 @@ function plan(actions: ClawUpdatePlan["actions"]): ClawUpdatePlan {
     },
     actions,
     capabilityChanges: [],
-    readiness: { ready: true, requirements: [] },
     blockers: [],
     diagnostics: [],
   };
@@ -136,17 +135,6 @@ const addPlan: ClawAddPlan = {
 };
 
 describe("applyClawPackageUpdate", () => {
-  it("hashes only persisted package provenance from enriched status records", () => {
-    const persisted = ref("plugin", "audit", "1.0.0");
-    expect(
-      digestClawPackageRef({
-        ...persisted,
-        state: "present",
-        extensionCompatibility: { state: "compatible" },
-      } as typeof persisted),
-    ).toBe(digestClawPackageRef(persisted));
-  });
-
   it("adds extension metadata to a reused v1 plugin edge without changing ownership", async () => {
     const previous = ref("plugin", "audit", "1.0.0");
     const extension = {

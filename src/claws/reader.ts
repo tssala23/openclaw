@@ -3,23 +3,26 @@ import { createHash } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { isScalar, parseDocument, visit } from "yaml";
-import { MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES } from "../agents/workspace-bootstrap-read.js";
 import { assertNoSymlinkParents } from "../infra/fs-safe-advanced.js";
 import { FsSafeError, root as fsSafeRoot, type OpenResult } from "../infra/fs-safe.js";
 import { readClawOpenClawProfile } from "./openclaw-profile.js";
 import { isCanonicalClawHubPackageName, isExactSemVer } from "./schema-portability.js";
 import { clawManifestWorkspaceConflictsWithPath, parseClawManifest } from "./schema.js";
+import { readClawSetupTemplates } from "./setup.js";
 import {
   MAX_CLAW_MANIFEST_BYTES,
   MAX_MANAGED_FILE_BYTES,
   MAX_MANAGED_WORKSPACE_BYTES,
 } from "./source-limits.js";
-import type {
-  ClawDiagnostic,
-  ClawManifest,
-  ClawReadResult,
-  ClawSourceIdentity,
-  ClawWorkspaceSourceSnapshot,
+import {
+  CLAW_SCHEMA_VERSION,
+  CLAW_SETUP_SCHEMA_VERSION,
+  type ClawDiagnostic,
+  type ClawManifest,
+  type ClawReadResult,
+  type ClawSourceIdentity,
+  type ClawSetupTemplateSnapshot,
+  type ClawWorkspaceSourceSnapshot,
 } from "./types.js";
 
 type PackageJson = {
@@ -34,6 +37,7 @@ type ResolvedClawSource = Omit<ClawSourceIdentity, "integrity" | "integrityKind"
 };
 
 const CLAW_MARKDOWN_FILENAME = "CLAW.md";
+
 const MAX_CLAW_PACKAGE_JSON_BYTES = 256 * 1024;
 
 async function readBoundedFile(path: string, maxBytes: number): Promise<Buffer> {
@@ -96,15 +100,19 @@ async function buildDevelopmentSnapshot(params: {
   manifest: ClawManifest;
   manifestRaw: Buffer;
   openClawProfile?: { path: string; raw: Buffer };
+  setupTemplates?: Array<{
+    source: string;
+    raw: Buffer;
+    content: string;
+    snapshot: ClawSetupTemplateSnapshot;
+  }>;
 }): Promise<
   | {
       ok: true;
       integrity: string;
       byteLength: number;
-      manifest: { byteLength: number; digest: string };
-      openClawProfile?: { sourcePath: string; byteLength: number; digest: string };
       workspaceSources: ClawWorkspaceSourceSnapshot[];
-      packageBootstrap?: ClawWorkspaceSourceSnapshot;
+      setupTemplates: ClawSetupTemplateSnapshot[];
     }
   | { ok: false; diagnostics: ClawDiagnostic[] }
 > {
@@ -114,21 +122,13 @@ async function buildDevelopmentSnapshot(params: {
     updateSnapshotHash(hash, label, bytes);
     byteLength += bytes.byteLength;
   };
-  const snapshotFile = (bytes: Buffer) => ({
-    byteLength: bytes.byteLength,
-    digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
-  });
-  const manifest = snapshotFile(params.manifestRaw);
-  const openClawProfile = params.openClawProfile
-    ? {
-        sourcePath: params.openClawProfile.path.replaceAll("\\", "/"),
-        ...snapshotFile(params.openClawProfile.raw),
-      }
-    : undefined;
   add("canonical-source", Buffer.from(params.source.manifestPath, "utf8"));
   add("manifest", params.manifestRaw);
   if (params.openClawProfile) {
     add(`profile:${params.openClawProfile.path.replaceAll("\\", "/")}`, params.openClawProfile.raw);
+  }
+  for (const template of params.setupTemplates ?? []) {
+    add(`setup:${template.source.replaceAll("\\", "/")}`, template.raw);
   }
 
   if (params.source.kind === "package") {
@@ -142,54 +142,6 @@ async function buildDevelopmentSnapshot(params: {
     add("package.json", packageJson);
   }
 
-  const sourceRoot = await fsSafeRoot(params.source.packageRoot);
-  let packageBootstrap: ClawWorkspaceSourceSnapshot | undefined;
-  if (await sourceRoot.exists("BOOTSTRAP.md")) {
-    try {
-      const read = await sourceRoot.read("BOOTSTRAP.md", {
-        hardlinks: "reject",
-        maxBytes: MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES,
-        nonBlockingRead: true,
-        symlinks: "reject",
-      });
-      const text = new TextDecoder("utf-8", { fatal: true }).decode(read.buffer);
-      if (text.trim().length === 0) {
-        return {
-          ok: false,
-          diagnostics: [
-            fileDiagnostic(
-              "package_bootstrap_empty",
-              "Package-root BOOTSTRAP.md must contain first-run instructions.",
-              "$.bootstrap",
-            ),
-          ],
-        };
-      }
-      const digest = `sha256:${createHash("sha256").update(read.buffer).digest("hex")}`;
-      add("bootstrap:BOOTSTRAP.md", read.buffer);
-      packageBootstrap = {
-        sourcePath: "BOOTSTRAP.md",
-        realPath: read.realPath,
-        byteLength: read.buffer.byteLength,
-        digest,
-      };
-    } catch (error) {
-      const tooLarge = error instanceof FsSafeError && error.code === "too-large";
-      return {
-        ok: false,
-        diagnostics: [
-          fileDiagnostic(
-            tooLarge ? "package_bootstrap_too_large" : "package_bootstrap_invalid",
-            tooLarge
-              ? `Package-root BOOTSTRAP.md exceeds ${MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES} bytes.`
-              : `Package-root BOOTSTRAP.md must be a safe UTF-8 regular file: ${(error as Error).message}`,
-            "$.bootstrap",
-          ),
-        ],
-      };
-    }
-  }
-
   const declaredSources = [
     ...Object.values(params.manifest.workspace.bootstrapFiles)
       .filter((entry): entry is { source: string } => entry !== undefined)
@@ -197,6 +149,7 @@ async function buildDevelopmentSnapshot(params: {
     ...params.manifest.workspace.files.map((entry) => entry.source),
   ].toSorted((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
 
+  const sourceRoot = await fsSafeRoot(params.source.packageRoot);
   const openedSources: Array<{ sourcePath: string; opened: OpenResult }> = [];
   const workspaceSources: ClawWorkspaceSourceSnapshot[] = [];
   try {
@@ -285,10 +238,8 @@ async function buildDevelopmentSnapshot(params: {
     ok: true,
     integrity: `sha256:${hash.digest("hex")}`,
     byteLength,
-    manifest,
-    ...(openClawProfile ? { openClawProfile } : {}),
     workspaceSources,
-    ...(packageBootstrap ? { packageBootstrap } : {}),
+    setupTemplates: (params.setupTemplates ?? []).map((template) => template.snapshot),
   };
 }
 
@@ -630,10 +581,32 @@ export async function readClawManifestFile(path: string): Promise<ClawReadResult
   }
   const profile = await readClawOpenClawProfile({
     packageRoot: sourceResult.source.packageRoot,
-    metadata: parsed.manifest.metadata,
+    manifest: parsed.manifest,
   });
   if (!profile.ok) {
     return profile;
+  }
+  if (
+    parsed.manifest.schemaVersion === CLAW_SCHEMA_VERSION &&
+    profile.profile?.schemaVersion === CLAW_SETUP_SCHEMA_VERSION
+  ) {
+    return {
+      ok: false,
+      diagnostics: [
+        fileDiagnostic(
+          "openclaw_profile_version_mismatch",
+          "OpenClaw profile schema version 2 requires Claw schema version 2.",
+          "$.metadata.openclaw.config.schemaVersion",
+        ),
+      ],
+    };
+  }
+  const setupTemplates = await readClawSetupTemplates({
+    packageRoot: sourceResult.source.packageRoot,
+    manifest: parsed.manifest,
+  });
+  if (!setupTemplates.ok) {
+    return setupTemplates;
   }
   const snapshot = await buildDevelopmentSnapshot({
     source: sourceResult.source,
@@ -642,6 +615,7 @@ export async function readClawManifestFile(path: string): Promise<ClawReadResult
     ...(profile.raw && profile.path
       ? { openClawProfile: { path: profile.path, raw: profile.raw } }
       : {}),
+    setupTemplates: setupTemplates.templates,
   });
   if (!snapshot.ok) {
     return snapshot;
@@ -661,15 +635,12 @@ export async function readClawManifestFile(path: string): Promise<ClawReadResult
     ok: true,
     manifest: parsed.manifest,
     ...(hasMarkdownBody ? { clawMarkdownBody: manifestResult.body } : {}),
-    ...(snapshot.packageBootstrap ? { packageBootstrap: snapshot.packageBootstrap } : {}),
     ...(profile.profile ? { openClawProfile: profile.profile } : {}),
     source,
     snapshot: {
-      manifest: snapshot.manifest,
-      ...(snapshot.openClawProfile ? { openClawProfile: snapshot.openClawProfile } : {}),
       workspaceSources: snapshot.workspaceSources,
-      ...(snapshot.packageBootstrap ? { packageBootstrap: snapshot.packageBootstrap } : {}),
+      setupTemplates: snapshot.setupTemplates,
     },
-    diagnostics: [...parsed.diagnostics, ...(profile.diagnostics ?? [])],
+    diagnostics: parsed.diagnostics,
   };
 }

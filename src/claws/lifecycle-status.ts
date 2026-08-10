@@ -1,25 +1,18 @@
-import { stableStringify } from "@openclaw/normalization-core";
 import { listAgentEntries } from "../agents/agent-scope.js";
+import { stableStringify } from "../agents/stable-stringify.js";
 import { getRuntimeConfig } from "../config/config.js";
 import { normalizeConfiguredMcpServers } from "../config/mcp-config-normalize.js";
 import { listConfiguredMcpServers } from "../config/mcp-config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import {
-  inspectBundlePluginArtifact,
-  inspectNativePluginArtifact,
-  PLUGIN_ARTIFACT_ADAPTER_IDENTITY,
-} from "../plugins/install-artifact-inspection.js";
 import type { OpenClawStateDatabaseOptions } from "../state/openclaw-state-db.js";
 import { readClawCronRefs, type PersistedClawCronRef } from "./cron.js";
 import { digestClawAgentConfig } from "./lifecycle-config-removal.js";
 import {
   ClawRemoveError,
-  inspectClawBootstrap,
   inspectClawWorkspaceFile,
   readAllClawWorkspaceFiles,
   synthesizeOrphanInstall,
   type ClawManagedFileStatus,
-  type ClawBootstrapStatus,
 } from "./lifecycle-delete-support.js";
 import {
   digestClawMcpServer,
@@ -32,16 +25,52 @@ import {
   type ClawPackageInspection,
   type PackageRemovalDeps,
 } from "./package-remove.js";
+import { preflightClawPackage } from "./packages.js";
 import {
   readClawInstallRecords,
   readClawPackageRefs,
   type PersistedClawInstall,
   type PersistedClawPackageRef,
 } from "./provenance.js";
-import { CLAW_OUTPUT_STABILITY, type ClawPackagePreflight } from "./types.js";
+import {
+  readClawSetupPending,
+  readClawSetupState,
+  type PersistedClawSetupPending,
+  type PersistedClawSetupState,
+} from "./setup-state.js";
+import {
+  CLAW_OUTPUT_STABILITY,
+  CLAW_SETUP_SCHEMA_VERSION,
+  type ClawPackagePreflight,
+} from "./types.js";
 import { readClawWorkspaceFiles } from "./workspace.js";
 
 const CLAW_STATUS_SCHEMA_VERSION = "openclaw.clawStatus.v1" as const;
+
+type ClawSetupStatus = Pick<
+  PersistedClawSetupState,
+  | "schemaVersion"
+  | "agentId"
+  | "clawName"
+  | "clawVersion"
+  | "setupSchemaDigest"
+  | "seeds"
+  | "status"
+  | "appliedAtMs"
+  | "updatedAtMs"
+>;
+
+type ClawSetupPendingStatus = Pick<
+  PersistedClawSetupPending,
+  | "schemaVersion"
+  | "agentId"
+  | "clawName"
+  | "clawVersion"
+  | "setupSchemaDigest"
+  | "seeds"
+  | "status"
+  | "updatedAtMs"
+>;
 
 type ClawMcpServerStatus = PersistedClawMcpServerRef & {
   state: "present" | "modified" | "missing" | "pending" | "failed";
@@ -62,7 +91,7 @@ async function inspectClawPackageCompatibility(params: {
   install: PersistedClawInstall;
   packageRef: PersistedClawPackageRef;
   packageDeps?: PackageRemovalDeps;
-  packagePreflight?: ClawPackagePreflight;
+  packagePreflight: ClawPackagePreflight;
 }): Promise<ClawPackageStatus> {
   const inspected: ClawPackageStatus = await inspectClawPackage(
     params.install,
@@ -72,48 +101,22 @@ async function inspectClawPackageCompatibility(params: {
   if (!params.packageRef.extension || inspected.state !== "present") {
     return inspected;
   }
-  let current: {
-    detectedFormat: NonNullable<ClawPackageInspection["extension"]>["detectedFormat"];
-    mapped: string[];
-    unavailable: string[];
-    adapterIdentity: string;
-  };
-  if (params.packagePreflight) {
-    const preflight = await params.packagePreflight(params.packageRef, params.install.workspace);
-    if (!preflight.ok) {
-      inspected.extensionCompatibility = {
-        state: "unavailable",
-        mapped: [],
-        unavailable: [],
-        message: preflight.message ?? "Canonical extension inspection is unavailable.",
-      };
-      return inspected;
-    }
-    current = {
-      detectedFormat: preflight.detectedFormat!,
-      mapped: preflight.mapped ?? [],
-      unavailable: preflight.unavailable ?? [],
-      adapterIdentity: preflight.adapterIdentity!,
+  const preflight = await params.packagePreflight(params.packageRef, params.install.workspace);
+  if (!preflight.ok) {
+    inspected.extensionCompatibility = {
+      state: "unavailable",
+      mapped: [],
+      unavailable: [],
+      message: preflight.message ?? "Canonical extension inspection is unavailable.",
     };
-  } else {
-    // Status and doctor stay offline. Artifact identity was verified above, so the
-    // current adapter can recompute compatibility from persisted capability inventory.
-    // Update planning supplies packagePreflight and reports unavailable inspection.
-    const recorded = params.packageRef.extension;
-    const artifact =
-      recorded.detectedFormat === "openclaw"
-        ? inspectNativePluginArtifact()
-        : inspectBundlePluginArtifact({
-            format: recorded.detectedFormat,
-            capabilities: [...recorded.mapped, ...recorded.unavailable],
-          });
-    current = {
-      detectedFormat: recorded.detectedFormat,
-      mapped: artifact.mapped,
-      unavailable: artifact.unavailable,
-      adapterIdentity: PLUGIN_ARTIFACT_ADAPTER_IDENTITY,
-    };
+    return inspected;
   }
+  const current = {
+    detectedFormat: preflight.detectedFormat,
+    mapped: preflight.mapped ?? [],
+    unavailable: preflight.unavailable ?? [],
+    adapterIdentity: preflight.adapterIdentity,
+  };
   const recorded = {
     detectedFormat: params.packageRef.extension.detectedFormat,
     mapped: params.packageRef.extension.mapped,
@@ -122,10 +125,10 @@ async function inspectClawPackageCompatibility(params: {
   };
   inspected.extensionCompatibility = {
     state: stableStringify(current) === stableStringify(recorded) ? "compatible" : "drifted",
-    detectedFormat: current.detectedFormat,
+    ...(preflight.detectedFormat ? { detectedFormat: preflight.detectedFormat } : {}),
     mapped: current.mapped,
     unavailable: current.unavailable,
-    adapterIdentity: current.adapterIdentity,
+    ...(preflight.adapterIdentity ? { adapterIdentity: preflight.adapterIdentity } : {}),
   };
   return inspected;
 }
@@ -134,13 +137,40 @@ export type ClawStatusRecord = {
   install: PersistedClawInstall;
   orphaned?: boolean;
   agentState: "present" | "modified" | "missing";
-  bootstrapState: ClawBootstrapStatus["state"];
-  bootstrap: ClawBootstrapStatus;
   workspaceFiles: ClawManagedFileStatus[];
   packages: ClawPackageStatus[];
   mcpServers: ClawMcpServerStatus[];
   cronJobs: PersistedClawCronRef[];
+  setup?: ClawSetupStatus;
+  setupUpdate?: ClawSetupPendingStatus;
 };
+
+function projectSetupStatus(state: PersistedClawSetupState): ClawSetupStatus {
+  return {
+    schemaVersion: state.schemaVersion,
+    agentId: state.agentId,
+    clawName: state.clawName,
+    clawVersion: state.clawVersion,
+    setupSchemaDigest: state.setupSchemaDigest,
+    seeds: state.seeds,
+    status: state.status,
+    ...(state.appliedAtMs === undefined ? {} : { appliedAtMs: state.appliedAtMs }),
+    updatedAtMs: state.updatedAtMs,
+  };
+}
+
+function projectSetupPendingStatus(state: PersistedClawSetupPending): ClawSetupPendingStatus {
+  return {
+    schemaVersion: state.schemaVersion,
+    agentId: state.agentId,
+    clawName: state.clawName,
+    clawVersion: state.clawVersion,
+    setupSchemaDigest: state.setupSchemaDigest,
+    seeds: state.seeds,
+    status: state.status,
+    updatedAtMs: state.updatedAtMs,
+  };
+}
 
 type ClawStatusResult = {
   schemaVersion: typeof CLAW_STATUS_SCHEMA_VERSION;
@@ -150,7 +180,6 @@ type ClawStatusResult = {
   summary: {
     claws: number;
     partial: number;
-    pendingBootstrap: number;
     missingAgents: number;
     driftedFiles: number;
     packageRefs: number;
@@ -163,6 +192,8 @@ type ClawStatusResult = {
     unresolvedMcpServerRefs: number;
     cronRefs: number;
     unresolvedCronRefs: number;
+    personalizationSeeds: number;
+    incompleteSetup: number;
   };
 };
 
@@ -237,7 +268,7 @@ export async function readClawStatus(
     (install) => !target || install.agentId === target || install.claw.name === target,
   );
   const records: ClawStatusRecord[] = [];
-  const packagePreflight = options.packagePreflight;
+  const packagePreflight = options.packagePreflight ?? preflightClawPackage;
   for (const install of installs) {
     const agent = listAgentEntries(config).find((candidate) => candidate.id === install.agentId);
     const packageRefs = allPackageRefs.filter(
@@ -246,13 +277,8 @@ export async function readClawStatus(
     const workspaceFiles = installAgentIds.has(install.agentId)
       ? readClawWorkspaceFiles(install.agentId, options)
       : allWorkspaceFiles.filter((file) => file.agentId === install.agentId);
-    const bootstrap = installAgentIds.has(install.agentId)
-      ? await inspectClawBootstrap(install, options)
-      : {
-          state: "unknown" as const,
-          workspace: install.workspace,
-          path: "BOOTSTRAP.md" as const,
-        };
+    const setup = readClawSetupState(install.agentId, options);
+    const setupUpdate = readClawSetupPending(install.agentId, options);
     records.push({
       install,
       ...(installAgentIds.has(install.agentId) ? {} : { orphaned: true }),
@@ -261,8 +287,6 @@ export async function readClawStatus(
         : digestClawAgentConfig(agent) === install.agentConfigDigest
           ? "present"
           : "modified",
-      bootstrapState: bootstrap.state,
-      bootstrap,
       workspaceFiles: await Promise.all(workspaceFiles.map(inspectClawWorkspaceFile)),
       packages: await Promise.all(
         packageRefs.map(
@@ -280,6 +304,8 @@ export async function readClawStatus(
         : reconcileClawMcpServerRefs(install.agentId, configuredMcpServers, options)
       ).map((ref) => inspectMcpServer(ref, configuredMcpServers)),
       cronJobs: readClawCronRefs(install.agentId, options),
+      ...(setup ? { setup: projectSetupStatus(setup) } : {}),
+      ...(setupUpdate ? { setupUpdate: projectSetupPendingStatus(setupUpdate) } : {}),
     });
   }
   return {
@@ -289,8 +315,12 @@ export async function readClawStatus(
     records,
     summary: {
       claws: records.length,
-      partial: records.filter((record) => record.install.status !== "complete").length,
-      pendingBootstrap: records.filter((record) => record.bootstrapState === "pending").length,
+      partial: records.filter(
+        (record) =>
+          record.install.status !== "complete" ||
+          (record.setup !== undefined && record.setup.status !== "complete") ||
+          record.setupUpdate !== undefined,
+      ).length,
       missingAgents: records.filter((record) => record.agentState === "missing").length,
       driftedFiles: records
         .flatMap((record) => record.workspaceFiles)
@@ -324,6 +354,19 @@ export async function readClawStatus(
       unresolvedCronRefs: records
         .flatMap((record) => record.cronJobs)
         .filter((cron) => cron.status !== "complete" || !cron.schedulerJobId).length,
+      personalizationSeeds: records.flatMap((record) => {
+        const destinations = new Set([
+          ...(record.setup?.seeds.map((seed) => seed.destination) ?? []),
+          ...(record.setupUpdate?.seeds.map((seed) => seed.destination) ?? []),
+        ]);
+        return [...destinations];
+      }).length,
+      incompleteSetup: records.filter(
+        (record) =>
+          (record.install.manifestSchemaVersion === CLAW_SETUP_SCHEMA_VERSION && !record.setup) ||
+          (record.setup !== undefined && record.setup.status !== "complete") ||
+          record.setupUpdate !== undefined,
+      ).length,
     },
   };
 }

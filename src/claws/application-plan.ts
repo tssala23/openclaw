@@ -1,13 +1,14 @@
 import { createHash } from "node:crypto";
-import { stableStringify } from "@openclaw/normalization-core";
+import { stableStringify } from "../agents/stable-stringify.js";
+import { CLAW_OPENCLAW_PROFILE_EXTENSIONS_SCHEMA_VERSION } from "./types.js";
 import type {
   ClawAddCapabilityChange,
   ClawAddPlanAction,
   ClawDiagnostic,
   ClawExtensionPlan,
-  ClawLocalPrerequisite,
   ClawOpenClawExtension,
   ClawOpenClawProfile,
+  ClawLocalPrerequisite,
   ClawPackage,
   ClawPackagePreflight,
   ClawPackagePreflightResult,
@@ -16,7 +17,10 @@ import type {
 export function clawProfileExtensionPackages(
   profile: ClawOpenClawProfile | undefined,
 ): ClawPackage[] {
-  return (profile?.extensions ?? []).map((extension) => ({
+  if (profile?.schemaVersion !== CLAW_OPENCLAW_PROFILE_EXTENSIONS_SCHEMA_VERSION) {
+    return [];
+  }
+  return profile.extensions.map((extension) => ({
     kind: "plugin",
     source: extension.source,
     ref: extension.ref,
@@ -26,32 +30,6 @@ export function clawProfileExtensionPackages(
 
 function blocker(code: string, path: string, message: string): ClawDiagnostic {
   return { level: "error", code, phase: "plan", path, message };
-}
-
-export function findClawExtensionPackageCollisions(params: {
-  packages: ClawPackage[];
-  extensions: ClawOpenClawExtension[];
-}): Array<{ index: number; diagnostic: ClawDiagnostic }> {
-  const declaredPackageIds = new Set(params.packages.map((pkg) => `${pkg.kind}:${pkg.ref}`));
-  const collisions: Array<{ index: number; diagnostic: ClawDiagnostic }> = [];
-
-  for (const [index, extension] of params.extensions.entries()) {
-    const packageId = `plugin:${extension.ref}`;
-    if (declaredPackageIds.has(packageId)) {
-      collisions.push({
-        index,
-        diagnostic: blocker(
-          "extension_package_collision",
-          `$.profiles.openclaw.extensions[${index}]`,
-          `Extension package ${JSON.stringify(packageId)} is already declared by the portable manifest or another profile extension.`,
-        ),
-      });
-      continue;
-    }
-    declaredPackageIds.add(packageId);
-  }
-
-  return collisions;
 }
 
 function extensionCapabilityChange(params: {
@@ -76,11 +54,8 @@ function extensionCapabilityChange(params: {
     kind: "package" as const,
     id: `extension:${params.extension.id}`,
     path: `openclaw.extensions.${params.extension.id}`,
-    action: params.preflight.action === "reuse" ? ("reuse" as const) : ("install" as const),
-    reason:
-      params.preflight.action === "reuse"
-        ? "The OpenClaw profile requires access to an existing native extension."
-        : "The OpenClaw profile requires installation of native extension content or executable code.",
+    action: "install" as const,
+    reason: "The OpenClaw profile declares downloadable extension content or executable code.",
     effect,
   };
   return {
@@ -124,35 +99,31 @@ export async function planClawExtensions(params: {
           code: "package_install_unavailable",
           message: "Extension preflight is unavailable.",
         };
-    const completeProvenance =
-      preflight.ok &&
-      Boolean(
-        preflight.integrity &&
-        preflight.installId &&
-        preflight.action &&
-        preflight.detectedFormat &&
-        preflight.adapterIdentity,
-      );
     const incompleteProvenance =
-      preflight.ok && !completeProvenance
+      preflight.ok &&
+      (!preflight.integrity ||
+        !preflight.installId ||
+        !preflight.action ||
+        !preflight.detectedFormat ||
+        !preflight.adapterIdentity)
         ? blocker(
             "extension_provenance_incomplete",
-            `$.profiles.openclaw.extensions[${index}]`,
+            `$.metadata.openclaw.config.extensions[${index}]`,
             `Extension ${JSON.stringify(extension.id)} did not resolve complete canonical identity and adapter provenance.`,
           )
         : undefined;
     const formatMismatch =
-      preflight.ok && completeProvenance && preflight.detectedFormat !== extension.format
+      preflight.ok && !incompleteProvenance && preflight.detectedFormat !== extension.format
         ? blocker(
             "extension_format_mismatch",
-            `$.profiles.openclaw.extensions[${index}].format`,
+            `$.metadata.openclaw.config.extensions[${index}].format`,
             `Extension ${JSON.stringify(extension.id)} declares format ${JSON.stringify(extension.format)}, but the canonical plugin detector found ${JSON.stringify(preflight.detectedFormat ?? "unknown")}.`,
           )
         : undefined;
     const diagnostic = !preflight.ok
       ? blocker(
           preflight.code ?? "extension_preflight_failed",
-          `$.profiles.openclaw.extensions[${index}]`,
+          `$.metadata.openclaw.config.extensions[${index}]`,
           preflight.message ?? "Extension preflight failed.",
         )
       : (incompleteProvenance ?? formatMismatch);
@@ -162,20 +133,12 @@ export async function planClawExtensions(params: {
     if (preflight.ok && preflight.requirements) {
       requirements.push(...preflight.requirements);
     }
-    const requirementState: ClawExtensionPlan["requirementState"] = diagnostic
-      ? "conflicting"
-      : preflight.action === "install"
-        ? "missing-installable"
-        : preflight.requirements && preflight.requirements.length > 0
-          ? "setup-required"
-          : "satisfied";
     const extensionPlan: ClawExtensionPlan = {
       ...extension,
       ...(preflight.detectedFormat ? { detectedFormat: preflight.detectedFormat } : {}),
       ...(preflight.integrity ? { integrity: preflight.integrity } : {}),
       ...(preflight.installId ? { installId: preflight.installId } : {}),
       ...(preflight.action ? { ownerAction: preflight.action } : {}),
-      requirementState,
       mapped: preflight.mapped ?? [],
       unavailable: preflight.unavailable ?? [],
       ...(preflight.adapterIdentity ? { adapterIdentity: preflight.adapterIdentity } : {}),
@@ -185,7 +148,7 @@ export async function planClawExtensions(params: {
     actions.push({
       kind: "package",
       id: `plugin:${extension.ref}`,
-      action: preflight.ok && preflight.action === "reuse" ? "reuse" : "install",
+      action: "install",
       target: `${extension.source}:${extension.ref}@${extension.version}`,
       ...(preflight.integrity ? { digest: preflight.integrity } : {}),
       details: {
@@ -196,26 +159,21 @@ export async function planClawExtensions(params: {
         ...(preflight.integrity ? { integrity: preflight.integrity } : {}),
         ...(preflight.installId ? { installId: preflight.installId } : {}),
         ...(preflight.action ? { ownerAction: preflight.action } : {}),
-        requirementState,
-        ...(preflight.requirements ? { prerequisites: preflight.requirements } : {}),
-        ...(completeProvenance
-          ? {
-              extension: {
-                id: extension.id,
-                format: extension.format,
-                detectedFormat: preflight.detectedFormat!,
-                mapped: preflight.mapped ?? [],
-                unavailable: preflight.unavailable ?? [],
-                adapterIdentity: preflight.adapterIdentity!,
-              },
-            }
-          : {}),
+        extension: {
+          id: extension.id,
+          format: extension.format,
+          ...(preflight.detectedFormat ? { detectedFormat: preflight.detectedFormat } : {}),
+          mapped: preflight.mapped ?? [],
+          unavailable: preflight.unavailable ?? [],
+          ...(preflight.adapterIdentity ? { adapterIdentity: preflight.adapterIdentity } : {}),
+        },
         expectedState: !preflight.ok
           ? "unresolved"
           : preflight.action === "reuse"
             ? "present-exact"
             : "absent",
         ...(preflight.warning ? { riskWarning: preflight.warning } : {}),
+        ...(preflight.requirements ? { prerequisites: preflight.requirements } : {}),
       },
       blocked: extensionPlan.blocked,
       ...(diagnostic ? { reason: diagnostic.message } : {}),

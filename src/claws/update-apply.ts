@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { stableStringify } from "@openclaw/normalization-core";
 import { listAgentEntries } from "../agents/agent-scope.js";
+import { stableStringify } from "../agents/stable-stringify.js";
 import { transformConfigFileWithRetry } from "../config/config.js";
 import type { AgentConfig } from "../config/types.agents.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -24,13 +24,24 @@ import {
   type ClawPackageUpdateExecution,
 } from "./package-update.js";
 import {
+  ClawPersonalizationError,
+  createClawUpdatePersonalizationSeeds,
+} from "./personalization.js";
+import {
   readClawInstallRecord,
   updateClawInstallRecord,
   updateClawInstallRecordStatus,
   type PersistedClawInstall,
 } from "./provenance.js";
+import { buildClawSetupReconciliation } from "./setup-reconcile.js";
+import {
+  finalizeClawSetupUpdate,
+  readClawSetupPending,
+  readClawSetupState,
+} from "./setup-state.js";
 import {
   CLAW_OUTPUT_STABILITY,
+  CLAW_SETUP_SCHEMA_VERSION,
   type ClawManifest,
   type ClawOpenClawProfile,
   type ClawSourceIdentity,
@@ -41,6 +52,7 @@ import {
   ClawWorkspaceUpdateError,
   type ClawWorkspaceUpdateExecution,
 } from "./workspace-update.js";
+import { readClawWorkspaceFiles } from "./workspace.js";
 
 export const CLAW_UPDATE_RESULT_SCHEMA_VERSION = "openclaw.clawUpdateResult.v1" as const;
 
@@ -79,9 +91,9 @@ function comparablePlan(plan: ClawUpdatePlan): unknown {
     agentId: plan.agentId,
     currentClaw: plan.currentClaw,
     targetClaw: plan.targetClaw,
+    setup: plan.setup,
     actions: plan.actions,
     capabilityChanges: plan.capabilityChanges,
-    readiness: plan.readiness,
     blockers: plan.blockers,
   };
 }
@@ -93,6 +105,7 @@ export async function applyClawUpdatePlan(
     targetClawMarkdownBody?: Buffer;
     targetOpenClawProfile?: ClawOpenClawProfile;
     targetSource: ClawSourceIdentity;
+    answers?: unknown;
   },
   options: OpenClawStateDatabaseOptions & {
     config: OpenClawConfig;
@@ -108,6 +121,8 @@ export async function applyClawUpdatePlan(
     applyMcp?: typeof applyClawMcpUpdate;
     applyCron?: typeof applyClawCronUpdate;
     applyPackage?: typeof applyClawPackageUpdate;
+    applySetup?: typeof createClawUpdatePersonalizationSeeds;
+    finalizeSetup?: typeof finalizeClawSetupUpdate;
     cronGateway?: ClawCronGateway;
   },
 ): Promise<ClawUpdateResult> {
@@ -135,6 +150,7 @@ export async function applyClawUpdatePlan(
     sourceMcpServers: options.sourceMcpServers,
     stateOptions: options,
     packagePreflight: options.packagePreflight,
+    answers: params.answers,
   });
   if (
     fresh.planIntegrity !== plan.planIntegrity ||
@@ -151,6 +167,7 @@ export async function applyClawUpdatePlan(
     (action) =>
       action.kind !== "agent" &&
       action.kind !== "workspaceFile" &&
+      action.kind !== "personalizationSeed" &&
       action.kind !== "mcpServer" &&
       action.kind !== "cronJob" &&
       action.kind !== "package",
@@ -182,12 +199,12 @@ export async function applyClawUpdatePlan(
   const targetAddPlan = await buildAddPlan({
     manifest: params.targetManifest,
     clawMarkdownBody: params.targetClawMarkdownBody,
-    includePackageBootstrap: false,
     openClawProfile: params.targetOpenClawProfile,
     source: params.targetSource,
     context: {
       agentId: fresh.agentId,
       workspace: currentInstall.workspace,
+      resumableWorkspace: currentInstall.workspace,
       packagePreflight: async (pkg, workspace) => {
         const preflight = options.packagePreflight
           ? await options.packagePreflight(pkg, workspace)
@@ -209,11 +226,6 @@ export async function applyClawUpdatePlan(
               ...(preflight.integrity ? { integrity: preflight.integrity } : {}),
               ...(preflight.installId ? { installId: preflight.installId } : {}),
               ...(preflight.warning ? { warning: preflight.warning } : {}),
-              ...(preflight.requirements ? { requirements: preflight.requirements } : {}),
-              ...(preflight.detectedFormat ? { detectedFormat: preflight.detectedFormat } : {}),
-              ...(preflight.mapped ? { mapped: preflight.mapped } : {}),
-              ...(preflight.unavailable ? { unavailable: preflight.unavailable } : {}),
-              ...(preflight.adapterIdentity ? { adapterIdentity: preflight.adapterIdentity } : {}),
             }
           : preflight;
       },
@@ -221,12 +233,43 @@ export async function applyClawUpdatePlan(
   });
   if (
     targetAddPlan.blockers.some(
-      (blocker) => blocker.code !== "agent_id_collision" && blocker.code !== "workspace_collision",
+      (blocker) =>
+        blocker.code !== "agent_id_collision" &&
+        blocker.code !== "workspace_collision" &&
+        !blocker.code.startsWith("setup_"),
     )
   ) {
     throw new ClawUpdateMutationError(
       "update_target_blocked",
       "The target Claw cannot be safely materialized for update.",
+    );
+  }
+  const setupReconciliation = await buildClawSetupReconciliation({
+    currentManifestSchemaVersion: currentInstall.manifestSchemaVersion,
+    currentSetup: readClawSetupState(fresh.agentId, options),
+    currentPending: readClawSetupPending(fresh.agentId, options),
+    targetManifest: params.targetManifest,
+    targetSource: params.targetSource,
+    workspace: currentInstall.workspace,
+    workspaceFiles: readClawWorkspaceFiles(fresh.agentId, options),
+    answers: params.answers,
+  });
+  if (
+    setupReconciliation.blockers.length > 0 ||
+    (fresh.setup !== undefined &&
+      stableStringify({
+        currentSchemaDigest: setupReconciliation.currentSchemaDigest,
+        targetSchemaDigest: setupReconciliation.targetSchemaDigest,
+        answerDigest: setupReconciliation.answerDigest,
+        createdSeeds: setupReconciliation.createdSeeds,
+        regeneratedSeeds: setupReconciliation.regeneratedSeeds,
+        preservedSeeds: setupReconciliation.preservedSeeds,
+        releasedSeeds: setupReconciliation.releasedSeeds,
+      }) !== stableStringify(fresh.setup))
+  ) {
+    throw new ClawUpdateMutationError(
+      "update_changed",
+      "Claw personalization state changed after update planning; build a new dry-run plan.",
     );
   }
   const targetPackages = clawTargetPackages(params.targetManifest, params.targetOpenClawProfile);
@@ -249,7 +292,6 @@ export async function applyClawUpdatePlan(
           integrity: details?.integrity,
           installId: details?.installId,
           riskWarning: details?.riskWarning,
-          prerequisites: details?.prerequisites,
           extension: details?.extension,
         })
     ) {
@@ -260,41 +302,6 @@ export async function applyClawUpdatePlan(
     }
   }
 
-  const applyPackage = options.applyPackage ?? applyClawPackageUpdate;
-  const requirementActions = fresh.actions.filter(
-    (action) =>
-      action.kind === "package" &&
-      action.action !== "unchanged" &&
-      action.action !== "release" &&
-      action.action !== "remove" &&
-      targetPackages.get(action.id)?.kind === "plugin",
-  );
-  const remainingPackageActions = fresh.actions.filter(
-    (action) => action.kind === "package" && !requirementActions.includes(action),
-  );
-  const applyPackageActions = async (
-    actions: ClawUpdateAction[],
-  ): Promise<ClawPackageUpdateExecution> => {
-    if (actions.length === 0) {
-      return { appliedIds: [], rollback: async () => undefined };
-    }
-    return await applyPackage({ ...fresh, actions }, params.targetManifest, targetAddPlan, options);
-  };
-
-  let requirementExecution: ClawPackageUpdateExecution;
-  try {
-    requirementExecution = await applyPackageActions(requirementActions);
-  } catch (error) {
-    if (error instanceof ClawPackageUpdateError && error.partial) {
-      throw partialMutation(error.message);
-    }
-    throw new ClawUpdateMutationError(
-      "package_update_failed",
-      error instanceof Error ? error.message : String(error),
-    );
-  }
-  const retainedRequirementMutation = requirementExecution.appliedIds.length > 0;
-
   const applyWorkspace = options.applyWorkspace ?? applyClawWorkspaceUpdate;
   let workspaceExecution: ClawWorkspaceUpdateExecution;
   try {
@@ -302,11 +309,6 @@ export async function applyClawUpdatePlan(
   } catch (error) {
     if (error instanceof ClawWorkspaceUpdateError && error.partial) {
       throw partialMutation(error.message);
-    }
-    if (retainedRequirementMutation) {
-      throw partialMutation(
-        `${error instanceof Error ? error.message : String(error)}; successfully realized shared requirements were retained`,
-      );
     }
     throw new ClawUpdateMutationError(
       "workspace_update_failed",
@@ -330,20 +332,16 @@ export async function applyClawUpdatePlan(
     if (partial) {
       throw partialMutation(`${error.message}; MCP config write outcome is uncertain`);
     }
-    if (retainedRequirementMutation) {
-      throw partialMutation(
-        `${error instanceof Error ? error.message : String(error)}; successfully realized shared requirements were retained`,
-      );
-    }
     throw new ClawUpdateMutationError(
       "mcp_update_failed",
       error instanceof Error ? error.message : String(error),
     );
   }
 
+  const applyPackage = options.applyPackage ?? applyClawPackageUpdate;
   let packageExecution: ClawPackageUpdateExecution;
   try {
-    packageExecution = await applyPackageActions(remainingPackageActions);
+    packageExecution = await applyPackage(fresh, params.targetManifest, targetAddPlan, options);
   } catch (error) {
     const rollbackFailures: string[] = [];
     try {
@@ -366,11 +364,6 @@ export async function applyClawUpdatePlan(
     if (rollbackFailures.length > 0) {
       throw partialMutation(
         `${error instanceof Error ? error.message : String(error)}; ${rollbackFailures.join("; ")}`,
-      );
-    }
-    if (retainedRequirementMutation) {
-      throw partialMutation(
-        `${error instanceof Error ? error.message : String(error)}; successfully realized shared requirements were retained`,
       );
     }
     throw new ClawUpdateMutationError(
@@ -475,11 +468,6 @@ export async function applyClawUpdatePlan(
           `${error instanceof Error ? error.message : String(error)}; ${rollbackFailures.join("; ")}`,
         );
       }
-      if (retainedRequirementMutation) {
-        throw partialMutation(
-          `${error instanceof Error ? error.message : String(error)}; successfully realized shared requirements were retained`,
-        );
-      }
       if (error instanceof ClawUpdateMutationError) {
         throw error;
       }
@@ -544,15 +532,72 @@ export async function applyClawUpdatePlan(
         `${error instanceof Error ? error.message : String(error)}; ${rollbackFailures.join("; ")}`,
       );
     }
-    if (retainedRequirementMutation) {
-      throw partialMutation(
-        `${error instanceof Error ? error.message : String(error)}; successfully realized shared requirements were retained`,
-      );
-    }
     throw new ClawUpdateMutationError(
       "cron_update_failed",
       error instanceof Error ? error.message : String(error),
     );
+  }
+
+  if (params.targetManifest.schemaVersion === CLAW_SETUP_SCHEMA_VERSION) {
+    if (!setupReconciliation.materialization || !setupReconciliation.targetState) {
+      throw new ClawUpdateMutationError(
+        "setup_update_invalid",
+        "The target setup state could not be materialized for update.",
+      );
+    }
+    try {
+      await (options.applySetup ?? createClawUpdatePersonalizationSeeds)(
+        fresh,
+        currentInstall.workspace,
+        setupReconciliation.materialization,
+        setupReconciliation.targetState,
+        options,
+      );
+    } catch (error) {
+      const rollbackFailures: string[] = [];
+      try {
+        await rollbackAgent();
+      } catch (rollbackError) {
+        rollbackFailures.push(
+          `agent rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+      try {
+        await packageExecution.rollback();
+      } catch (rollbackError) {
+        rollbackFailures.push(
+          `package rollback incomplete: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+      try {
+        await cronExecution.rollback();
+      } catch (rollbackError) {
+        rollbackFailures.push(
+          `cron rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+      try {
+        await mcpExecution.rollback();
+      } catch (rollbackError) {
+        rollbackFailures.push(
+          `MCP rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+      try {
+        await workspaceExecution.rollback();
+      } catch (rollbackError) {
+        rollbackFailures.push(
+          `workspace rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+      const setupMessage =
+        error instanceof ClawPersonalizationError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      throw partialMutation([setupMessage, ...rollbackFailures].filter(Boolean).join("; "));
+    }
   }
 
   let installRecord: PersistedClawInstall;
@@ -603,15 +648,19 @@ export async function applyClawUpdatePlan(
         `${error instanceof Error ? error.message : String(error)}; ${rollbackFailures.join("; ")}`,
       );
     }
-    if (retainedRequirementMutation) {
-      throw partialMutation(
-        `${error instanceof Error ? error.message : String(error)}; successfully realized shared requirements were retained`,
-      );
-    }
     throw new ClawUpdateMutationError(
       "provenance_update_failed",
       error instanceof Error ? error.message : String(error),
     );
+  }
+  if (params.targetManifest.schemaVersion === CLAW_SETUP_SCHEMA_VERSION) {
+    try {
+      (options.finalizeSetup ?? finalizeClawSetupUpdate)(fresh.agentId, options);
+    } catch (error) {
+      throw partialMutation(
+        `Claw resources updated, but personalization state publication failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
   return {
     schemaVersion: CLAW_UPDATE_RESULT_SCHEMA_VERSION,

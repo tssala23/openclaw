@@ -2,20 +2,23 @@
 import { createHash } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { relative, resolve } from "node:path";
-import { stableStringify } from "@openclaw/normalization-core";
+import { resolve } from "node:path";
+import { stableStringify } from "../agents/stable-stringify.js";
 import { resolvePathViaExistingAncestorSync } from "../infra/boundary-path.js";
 import { assertNoSymlinkParents } from "../infra/fs-safe-advanced.js";
 import { FsSafeError, root as fsSafeRoot, type Root } from "../infra/fs-safe.js";
 import { resolveUserPath } from "../utils.js";
-import { findClawExtensionPackageCollisions, planClawExtensions } from "./application-plan.js";
+import { planClawExtensions } from "./application-plan.js";
 import { digestClawMcpServer } from "./mcp.js";
 import { clawManifestWorkspaceConflictsWithPath } from "./schema.js";
+import { buildClawSetupPlan } from "./setup.js";
 import { MAX_MANAGED_FILE_BYTES, MAX_MANAGED_WORKSPACE_BYTES } from "./source-limits.js";
 import {
   CLAW_ADD_PLAN_SCHEMA_VERSION,
   CLAW_BOOTSTRAP_FILE_NAMES,
+  CLAW_OPENCLAW_PROFILE_EXTENSIONS_SCHEMA_VERSION,
   CLAW_OUTPUT_STABILITY,
+  CLAW_SETUP_SCHEMA_VERSION,
   type ClawAddPlan,
   type ClawAddPlanAction,
   type ClawAddCapabilityChange,
@@ -26,7 +29,6 @@ import {
   type ClawPackagePreflight,
   type ClawPackagePreflightResult,
   type ClawSourceIdentity,
-  type ClawWorkspaceSourceSnapshot,
 } from "./types.js";
 
 const AGENT_ID_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -51,12 +53,7 @@ export type ClawAddPlanContext = {
   existingMcpServerNames?: Iterable<string>;
   existingMcpServers?: Record<string, Record<string, unknown>>;
   packagePreflight?: ClawPackagePreflight;
-  sourceReferenceRoot?: string;
 };
-
-function sourceReferencePath(root: string, path: string): string {
-  return `${root.replace(/\/+$/u, "")}/${path.replaceAll("\\", "/")}`;
-}
 
 function canonicalWorkspacePath(value: string): string {
   return resolvePathViaExistingAncestorSync(resolve(resolveUserPath(value)));
@@ -189,12 +186,11 @@ async function inspectWorkspaceFileAction(params: {
 export async function buildClawAddPlan(params: {
   manifest: ClawManifest;
   clawMarkdownBody?: Buffer;
-  packageBootstrap?: ClawWorkspaceSourceSnapshot;
-  includePackageBootstrap?: boolean;
   openClawProfile?: ClawOpenClawProfile;
   source: ClawSourceIdentity;
   diagnostics?: ClawDiagnostic[];
   context?: ClawAddPlanContext;
+  answers?: unknown;
 }): Promise<ClawAddPlan> {
   const context = params.context ?? {};
   const finalId = context.agentId ?? params.manifest.agent.id;
@@ -204,20 +200,7 @@ export async function buildClawAddPlan(params: {
   const packageRoot = await realpath(params.source.packageRoot).catch(
     () => params.source.packageRoot,
   );
-  const manifestPath = resolvePathViaExistingAncestorSync(resolve(params.source.manifestPath));
-  const source = { ...params.source, packageRoot, manifestPath };
-  const planSource = context.sourceReferenceRoot
-    ? {
-        ...source,
-        packageRoot: context.sourceReferenceRoot,
-        manifestPath: sourceReferencePath(
-          context.sourceReferenceRoot,
-          relative(packageRoot, manifestPath),
-        ),
-      }
-    : source;
-  const planSourcePath = (path: string, fallback: string): string =>
-    context.sourceReferenceRoot ? sourceReferencePath(context.sourceReferenceRoot, path) : fallback;
+  const source = { ...params.source, packageRoot };
   const sourceRoot = await fsSafeRoot(packageRoot);
   const blockers: ClawDiagnostic[] = [];
   const actions: ClawAddPlanAction[] = [];
@@ -312,33 +295,13 @@ export async function buildClawAddPlan(params: {
       : {}),
   });
 
-  if (params.packageBootstrap && params.includePackageBootstrap !== false) {
-    actions.push({
-      kind: "bootstrap",
-      id: "BOOTSTRAP.md",
-      action: "write",
-      target: resolve(workspace, "BOOTSTRAP.md"),
-      source: planSourcePath(params.packageBootstrap.sourcePath, params.packageBootstrap.realPath),
-      digest: params.packageBootstrap.digest,
-      details: {
-        sourcePath: params.packageBootstrap.sourcePath,
-        byteLength: params.packageBootstrap.byteLength,
-        expectedState: "absent-or-native-consumed",
-        lifecycle: "native-seed-once",
-      },
-      blocked: workspaceBlocked,
-      ...(workspaceBlocked
-        ? { reason: `Workspace ${JSON.stringify(workspace)} already exists.` }
-        : {}),
-    });
-  }
-
   const pendingWorkspaceFiles: PendingWorkspaceFileAction[] = [];
   async function addWorkspaceFileInspection(fileParams: {
     sourcePath: string;
     targetPath: string;
     id: string;
     manifestPath: string;
+    role?: "reference" | "schema" | "template" | "example" | "fixture" | "asset";
   }): Promise<void> {
     const result = await inspectWorkspaceFileAction({
       sourceRoot,
@@ -353,8 +316,8 @@ export async function buildClawAddPlan(params: {
     if (!action) {
       throw new Error("Claw workspace source inspection did not produce an action");
     }
-    if (action.source) {
-      action.source = planSourcePath(fileParams.sourcePath, action.source);
+    if (fileParams.role) {
+      action.details = { ...action.details, role: fileParams.role };
     }
     action.blocked ||= workspaceBlocked;
     if (workspaceBlocked) {
@@ -382,7 +345,7 @@ export async function buildClawAddPlan(params: {
         id: "SOUL.md",
         action: "write",
         target: resolve(workspace, "SOUL.md"),
-        source: planSource.manifestPath,
+        source: source.manifestPath,
         sourceKind: "clawMarkdownBody",
         blocked: true,
         reason: diagnostic.message,
@@ -398,7 +361,7 @@ export async function buildClawAddPlan(params: {
           id: "SOUL.md",
           action: "write",
           target: resolve(workspace, "SOUL.md"),
-          source: planSource.manifestPath,
+          source: source.manifestPath,
           sourceKind: "clawMarkdownBody",
           details: { expectedState: "absent" },
           blocked: false,
@@ -427,13 +390,55 @@ export async function buildClawAddPlan(params: {
       targetPath: file.path,
       id: file.path,
       manifestPath: `$.workspace.files[${index}]`,
+      ...(file.role ? { role: file.role } : {}),
     });
   }
 
-  const workspaceByteLength = pendingWorkspaceFiles.reduce(
-    (total, pending) => total + pending.byteLength,
-    0,
-  );
+  let setup: ClawAddPlan["setup"];
+  const setupActions: ClawAddPlanAction[] = [];
+  if (params.manifest.schemaVersion === CLAW_SETUP_SCHEMA_VERSION) {
+    const setupResult = await buildClawSetupPlan({
+      manifest: params.manifest,
+      packageRoot: source.packageRoot,
+      answers: params.answers,
+    });
+    setup = setupResult.plan;
+    blockers.push(...setup.diagnostics);
+    for (const seed of setup.seeds) {
+      const setupBlocked = seed.blocked || workspaceBlocked;
+      const action: ClawAddPlanAction = {
+        kind: "workspaceFile",
+        id: seed.destination,
+        action: "write",
+        target: resolve(workspace, seed.destination),
+        source: resolve(source.packageRoot, seed.source),
+        sourceKind: "personalizationSeed",
+        ...(seed.digest ? { digest: seed.digest } : {}),
+        details: {
+          expectedState: "absent",
+          ownershipAfterCreate: "user",
+          inputIds: seed.inputIds,
+          ...(seed.renderedByteLength !== undefined
+            ? { renderedByteLength: seed.renderedByteLength }
+            : {}),
+        },
+        blocked: setupBlocked,
+        ...(setupBlocked
+          ? {
+              reason: workspaceBlocked
+                ? `Workspace ${JSON.stringify(workspace)} already exists.`
+                : (setup.diagnostics[0]?.message ?? "Personalization setup is incomplete."),
+            }
+          : {}),
+      };
+      actions.push(action);
+      setupActions.push(action);
+    }
+  }
+
+  const workspaceByteLength =
+    pendingWorkspaceFiles.reduce((total, pending) => total + pending.byteLength, 0) +
+    (setup?.seeds.reduce((total, seed) => total + (seed.renderedByteLength ?? 0), 0) ?? 0);
   if (workspaceByteLength > MAX_MANAGED_WORKSPACE_BYTES) {
     const diagnostic = blocker(
       "workspace_sources_too_large",
@@ -444,6 +449,11 @@ export async function buildClawAddPlan(params: {
     for (const pending of pendingWorkspaceFiles) {
       pending.action.blocked = true;
       pending.action.reason = diagnostic.message;
+    }
+    for (const action of setupActions) {
+      action.blocked = true;
+      action.reason = diagnostic.message;
+      delete action.digest;
     }
   } else {
     for (const pending of pendingWorkspaceFiles) {
@@ -463,7 +473,7 @@ export async function buildClawAddPlan(params: {
           maxBytes: MAX_MANAGED_FILE_BYTES,
           symlinks: "reject",
         });
-        pending.action.source = planSourcePath(pending.sourcePath, read.realPath);
+        pending.action.source = read.realPath;
         pending.action.digest = `sha256:${createHash("sha256").update(read.buffer).digest("hex")}`;
       } catch (error) {
         const code = workspaceSourceErrorCode(error);
@@ -500,7 +510,7 @@ export async function buildClawAddPlan(params: {
     actions.push({
       kind: "package",
       id: `${pkg.kind}:${pkg.ref}`,
-      action: preflight.ok && preflight.action === "reuse" ? "reuse" : "install",
+      action: "install",
       target: `${pkg.source}:${pkg.ref}@${pkg.version}`,
       digest: preflight.integrity,
       details: {
@@ -515,13 +525,6 @@ export async function buildClawAddPlan(params: {
             ? "present-exact"
             : "absent",
         ownerAction: preflight.action,
-        requirementState: !preflight.ok
-          ? "conflicting"
-          : preflight.action === "install"
-            ? "missing-installable"
-            : preflight.requirements && preflight.requirements.length > 0
-              ? "setup-required"
-              : "satisfied",
       },
       blocked: !preflight.ok,
       ...(diagnostic ? { reason: diagnostic.message } : {}),
@@ -531,11 +534,8 @@ export async function buildClawAddPlan(params: {
         kind: "package",
         id: `${pkg.kind}:${pkg.ref}`,
         path: `packages.${pkg.kind}.${pkg.ref}`,
-        action: preflight.ok && preflight.action === "reuse" ? "reuse" : "install",
-        reason:
-          preflight.ok && preflight.action === "reuse"
-            ? "The Claw requires access to an existing package capability."
-            : "The Claw requires downloadable package content or executable code.",
+        action: "install",
+        reason: "The Claw declares downloadable package content or executable code.",
         effect: {
           kind: pkg.kind,
           source: pkg.source,
@@ -549,26 +549,19 @@ export async function buildClawAddPlan(params: {
     );
   }
 
+  const declaredExtensions =
+    params.openClawProfile?.schemaVersion === CLAW_OPENCLAW_PROFILE_EXTENSIONS_SCHEMA_VERSION
+      ? params.openClawProfile.extensions
+      : [];
   const extensionPlan = await planClawExtensions({
-    extensions: params.openClawProfile?.extensions ?? [],
+    extensions: declaredExtensions,
     workspace,
     packagePreflight: context.packagePreflight,
   });
   const extensions = extensionPlan.extensions;
-  const extensionCollisions = findClawExtensionPackageCollisions({
-    packages: params.manifest.packages,
-    extensions: params.openClawProfile?.extensions ?? [],
-  });
-  const collisionIndexes = new Set(extensionCollisions.map(({ index }) => index));
-  blockers.push(...extensionCollisions.map(({ diagnostic }) => diagnostic));
-  for (const [index, action] of extensionPlan.actions.entries()) {
-    if (collisionIndexes.has(index)) {
-      continue;
-    }
-    actions.push(action);
-  }
-  capabilityChanges.push(...extensionPlan.capabilityChanges);
   readinessRequirements.push(...extensionPlan.requirements);
+  actions.push(...extensionPlan.actions);
+  capabilityChanges.push(...extensionPlan.capabilityChanges);
   blockers.push(...extensionPlan.blockers);
 
   const existingMcpServerNames = new Set(context.existingMcpServerNames ?? []);
@@ -673,6 +666,7 @@ export async function buildClawAddPlan(params: {
         capabilityChanges,
         blockers,
         extensions,
+        setup,
       }),
     )
     .digest("hex")}`;
@@ -684,7 +678,7 @@ export async function buildClawAddPlan(params: {
     dryRun: true,
     mutationAllowed: false,
     planIntegrity,
-    claw: planSource,
+    claw: source,
     agent: {
       requestedId: params.manifest.agent.id,
       finalId,
@@ -695,10 +689,7 @@ export async function buildClawAddPlan(params: {
       totalActions: actions.length,
       agentActions: actions.filter((action) => action.kind === "agent").length,
       workspaceActions: actions.filter(
-        (action) =>
-          action.kind === "workspace" ||
-          action.kind === "bootstrap" ||
-          action.kind === "workspaceFile",
+        (action) => action.kind === "workspace" || action.kind === "workspaceFile",
       ).length,
       packageActions: actions.filter((action) => action.kind === "package").length,
       mcpServerActions: actions.filter((action) => action.kind === "mcpServer").length,
@@ -713,6 +704,7 @@ export async function buildClawAddPlan(params: {
       requirements: readinessRequirements,
     },
     extensions,
+    ...(setup ? { setup } : {}),
     blockers,
     diagnostics: params.diagnostics ?? [],
   };
