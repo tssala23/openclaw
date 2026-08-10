@@ -4,7 +4,7 @@ import {
   listAgentIds,
   resolveAgentWorkspaceDir,
 } from "../agents/agent-scope-config.js";
-import { stableStringify } from "../agents/stable-stringify.js";
+import { stableStringify } from "@openclaw/normalization-core";
 import {
   applyClawAddPlan,
   CLAW_ADD_RESULT_SCHEMA_VERSION,

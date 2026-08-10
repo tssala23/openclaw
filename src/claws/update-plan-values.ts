@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { stableStringify } from "../agents/stable-stringify.js";
+import { stableStringify } from "@openclaw/normalization-core";
 import type { ClawDiagnostic } from "./types.js";
 
 export function digestClawUpdateValue(value: unknown): string {

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
-import { stableStringify } from "../agents/stable-stringify.js";
+import { stableStringify } from "@openclaw/normalization-core";
 import { root as fsSafeRoot } from "../infra/fs-safe.js";
 import type {
   ClawSetupTargetState,

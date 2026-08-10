@@ -781,4 +781,4 @@ describe("applyClawUpdatePlan", () => {
   });
 });
 import { createHash } from "node:crypto";
-import { stableStringify } from "../agents/stable-stringify.js";
+import { stableStringify } from "@openclaw/normalization-core";
